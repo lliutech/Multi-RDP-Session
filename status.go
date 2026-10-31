@@ -1,6 +1,10 @@
 //go:build windows
 
-// status.go —— GUI 信息区数据:当前系统版本 / 工具针对版本 / termsrv 补丁状态
+// status.go —— 系统状态采集
+//
+// 这里只采集"事实"(版本号、命中数、策略状态码),文案一律在渲染时用 T() 生成。
+// 若在采集阶段就翻译,切换语言后界面会停留在旧语言 —— 卡片里的"策略已放开"
+// "补丁点"等字样就是这类残留。
 
 package main
 
@@ -32,17 +36,75 @@ const (
 	psUnlockable         // 未解锁,特征码全部命中,可一键解锁
 )
 
+// 策略层状态
+const (
+	polUntouched = iota // 未做任何修改
+	polRelaxed          // 已放开
+	polLimited          // 仍限制单用户单会话
+)
+
 type sysStatus struct {
-	OsVersion  string // "Windows 11 25H2 · Build 26200.9168 · Pro for Workstations"
-	OsShort    string // "Windows 11 25H2"
-	OsSub      string // "Build 26200.9168 · 专业工作站版"
-	TermsrvVer string // "10.0.26100.9949"
-	State      int    // psUnsupported / psUnlocked / psUnlockable
-	Detail     string // State 为 psUnsupported 时的原因
-	RDPEnabled bool
-	PatchText  string // "补丁点 3/3 唯一命中" / "已解锁 3/3"
-	PolicyText string // "策略已放开" / "策略层仍限制单会话"
-	HasState   bool   // 是否存在解锁操作记录(决定"一键还原"是否可用)
+	OsShort      string // "Windows 11 25H2"
+	OsBuild      string // "26200.9168"
+	Edition      string // EditionID,如 "ProfessionalWorkstation"
+	TermsrvVer   string // "10.0.26100.9949"
+	State        int    // psUnsupported / psUnlocked / psUnlockable
+	PatchN       int    // 唯一命中的补丁点数
+	PatchPatched int    // 已打补丁的补丁点数
+	Method       int    // 定位方式(methodExact / methodStructural)
+	Policy       int    // polUntouched / polRelaxed / polLimited
+	RDPEnabled   bool
+	HasState     bool   // 是否存在解锁记录(决定"一键还原"是否可用)
+	ReadErr      string // 读取 termsrv.dll 失败时的原始错误
+}
+
+// OsSubText 例如 "Build 26200.9168 · 专业工作站版"。
+func (s sysStatus) OsSubText() string {
+	ed := editionLabel(s.Edition)
+	if s.OsBuild == "" {
+		return ""
+	}
+	if ed == "" {
+		return "Build " + s.OsBuild
+	}
+	return fmt.Sprintf("Build %s · %s", s.OsBuild, ed)
+}
+
+// PatchText 信息卡第二列副标题。
+func (s sysStatus) PatchText() string {
+	total := len(patchDefs)
+	switch s.State {
+	case psUnlocked:
+		return fmt.Sprintf(T("补丁点 已解锁 %d/%d", "patch sites %d/%d patched"), s.PatchPatched, total)
+	case psUnlockable:
+		return fmt.Sprintf(T("补丁点 %d/%d 唯一命中(%s),可自动修补", "%d/%d patch sites matched (%s), ready to patch"),
+			s.PatchN, total, methodLabel(s.Method))
+	}
+	return fmt.Sprintf(T("补丁点 %d/%d", "patch sites %d/%d"), s.PatchN, total)
+}
+
+// PolicyText 信息卡第三列副标题。
+func (s sysStatus) PolicyText() string {
+	switch s.Policy {
+	case polRelaxed:
+		return T("策略已放开 · MaxConn 999999", "policy relaxed · MaxConn 999999")
+	case polLimited:
+		return T("策略层仍限制单用户单会话", "policy still limits one session per user")
+	}
+	return T("策略未做任何修改", "policy untouched")
+}
+
+// DetailText 状态为"不支持"时的原因(横幅用)。
+func (s sysStatus) DetailText() string {
+	if s.ReadErr != "" {
+		return T("读取 termsrv.dll 失败: ", "reading termsrv.dll failed: ") + s.ReadErr
+	}
+	if s.State != psUnsupported {
+		return ""
+	}
+	return fmt.Sprintf(T("仅命中 %d/%d 处补丁点(已解锁 %d 处)",
+		"only %d/%d patch sites matched (%d already patched)"),
+		s.PatchN, len(patchDefs), s.PatchPatched)
 }
 
 func regGetString(path, name string) string {
@@ -85,20 +147,11 @@ func editionLabel(id string) string {
 	return id
 }
 
-func osVersionText() string {
-	short, sub := osVersionParts()
-	if sub == "" {
-		return short
-	}
-	return short + " · " + sub
-}
-
-// osVersionParts 拆成"短标题 + 副标题",便于 UI 分两行排版而不被截断。
-func osVersionParts() (short, sub string) {
+func osVersionParts() (short, build, edition string) {
 	cv := `SOFTWARE\Microsoft\Windows NT\CurrentVersion`
 	display := regGetString(cv, "DisplayVersion")
-	build := regGetString(cv, "CurrentBuildNumber")
-	edition := regGetString(cv, "EditionID")
+	build = regGetString(cv, "CurrentBuildNumber")
+	edition = regGetString(cv, "EditionID")
 	ubr, _, _ := regGetDWORD(cv, "UBR")
 	if build == "" {
 		build = "?"
@@ -112,58 +165,50 @@ func osVersionParts() (short, sub string) {
 	if display == "" {
 		display = "?"
 	}
-	ed := editionLabel(edition)
-	if ed == "" {
-		ed = "?"
-	}
 	short = fmt.Sprintf("%s %s", family, display)
-	sub = fmt.Sprintf("Build %s.%d · %s", build, ubr, ed)
+	build = fmt.Sprintf("%s.%d", build, ubr)
 	return
 }
 
 func gatherStatus() sysStatus {
 	var st sysStatus
-	st.OsShort, st.OsSub = osVersionParts()
-	st.OsVersion = st.OsShort + " · " + st.OsSub
+	st.OsShort, st.OsBuild, st.Edition = osVersionParts()
 	if v, ok, _ := regGetDWORD(tsKey, "fDenyTSConnections"); ok && v == 0 {
 		st.RDPEnabled = true
 	}
 
-	// 策略层摘要
 	polSingle, polOK1, _ := regGetDWORD(polKey, "fSingleSessionPerUser")
 	tsSingle, polOK2, _ := regGetDWORD(tsKey, "fSingleSessionPerUser")
 	maxConn, polOK3, _ := regGetDWORD(polKey, "MaxConnectionCount")
 	switch {
 	case polOK1 && polSingle == 0 && polOK2 && tsSingle == 0 && polOK3 && maxConn > 1:
-		st.PolicyText = T("策略已放开 · MaxConn 999999", "policy relaxed · MaxConn 999999")
+		st.Policy = polRelaxed
 	case polOK1 || polOK2:
-		st.PolicyText = T("策略层仍限制单用户单会话", "policy still limits one session per user")
+		st.Policy = polLimited
 	default:
-		st.PolicyText = T("策略未做任何修改", "policy untouched")
+		st.Policy = polUntouched
 	}
 
 	data, err := os.ReadFile(termsrvPath)
 	if err != nil {
 		st.State = psUnsupported
-		st.Detail = T("读取 termsrv.dll 失败: ", "reading termsrv.dll failed: ") + err.Error()
+		st.ReadErr = err.Error()
 		return st
 	}
 	st.TermsrvVer = shortVer(dllFileVersion(termsrvPath))
 	st.HasState = loadState() != nil
+
 	sr := scanPatches(data)
+	st.PatchN = len(sr.Sites)
+	st.PatchPatched = sr.AlreadyPatched
+	st.Method = sr.Method
 	switch {
 	case sr.AlreadyPatched == len(patchDefs):
 		st.State = psUnlocked
-		st.PatchText = fmt.Sprintf(T("补丁点 已解锁 %d/%d", "patched %d/%d"), sr.AlreadyPatched, len(patchDefs))
 	case len(sr.Sites) == len(patchDefs):
 		st.State = psUnlockable
-		st.PatchText = fmt.Sprintf(T("补丁点 %d/%d 唯一命中(%s),可自动修补", "%d/%d patch sites matched (%s), ready to patch"),
-			len(sr.Sites), len(patchDefs), sr.Method)
 	default:
 		st.State = psUnsupported
-		st.Detail = fmt.Sprintf(T("仅命中 %d/%d 处补丁点(已解锁 %d 处)", "only %d/%d patch sites matched (%d already patched)"),
-			len(sr.Sites), len(patchDefs), sr.AlreadyPatched)
-		st.PatchText = fmt.Sprintf(T("补丁点 %d/%d", "patch sites %d/%d"), len(sr.Sites), len(patchDefs))
 	}
 	return st
 }

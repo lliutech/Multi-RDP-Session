@@ -344,13 +344,7 @@ func runGUI() {
 		procSetProcessDPIAware.Call()
 	}
 
-	loadLangPref()
-	switch os.Getenv("RDPMULTI_LANG") {
-	case "en":
-		setLangTransient(langEN)
-	case "zh":
-		setLangTransient(langZH)
-	}
+	initLang()
 
 	A = &app{
 		hideBuiltin: true,
@@ -791,8 +785,10 @@ func (a *app) banner() *bannerInfo {
 			"Remote Desktop is off; no device can connect"), lvWarn, idEnableRdp,
 			T("开启远程桌面", "Enable RDP")}
 	}
-	if a.st.State == psUnsupported && a.st.Detail != "" {
-		return &bannerInfo{T("无法自动补丁:", "Cannot patch automatically: ") + a.st.Detail, lvErr, idNone, ""}
+	if a.st.State == psUnsupported {
+		if d := a.st.DetailText(); d != "" {
+			return &bannerInfo{T("无法自动补丁:", "Cannot patch automatically: ") + d, lvErr, idNone, ""}
+		}
 	}
 	if a.accReady {
 		if usable, _ := a.accountStats(); usable == 0 {
@@ -851,11 +847,11 @@ func (a *app) drawInfoCard(c *surface, x, y, w, h float32) {
 
 	c.text(T("操作系统", "Operating system"), lbl(0), int32(a.s(9.5)), colTextMute, alignLeft, false)
 	c.text(orDefault(a.st.OsShort, T("读取中…", "reading…")), val(0), int32(a.s(12)), colText, alignLeft, true)
-	c.text(orDefault(a.st.OsSub, T("Build 读取中", "reading build")), sub(0), int32(a.s(9)), colTextMute, alignLeft, false)
+	c.text(orDefault(a.st.OsSubText(), T("Build 读取中", "reading build")), sub(0), int32(a.s(9)), colTextMute, alignLeft, false)
 
 	c.text(T("远程桌面服务", "Remote Desktop service"), lbl(1), int32(a.s(9.5)), colTextMute, alignLeft, false)
 	c.text(orDefault(a.st.TermsrvVer, T("读取中…", "reading…")), val(1), int32(a.s(12)), colText, alignLeft, true)
-	c.text(orDefault(a.st.PatchText, T("补丁点检测中…", "scanning patch sites…")), sub(1), int32(a.s(9)), colTextMute, alignLeft, false)
+	c.text(orDefault(a.st.PatchText(), T("补丁点检测中…", "scanning patch sites…")), sub(1), int32(a.s(9)), colTextMute, alignLeft, false)
 
 	c.text(T("并发状态", "Session state"), lbl(2), int32(a.s(9.5)), colTextMute, alignLeft, false)
 	stateTxt, stateCol := T("未解锁", "locked"), uint32(colWarn)
@@ -866,7 +862,7 @@ func (a *app) drawInfoCard(c *surface, x, y, w, h float32) {
 		stateTxt, stateCol = T("不支持", "unsupported"), colErr
 	}
 	c.text(stateTxt, val(2), int32(a.s(12)), stateCol, alignLeft, true)
-	c.text(orDefault(a.st.PolicyText, T("策略读取中", "reading policy")), sub(2), int32(a.s(9)), colTextMute, alignLeft, false)
+	c.text(orDefault(a.st.PolicyText(), T("策略读取中", "reading policy")), sub(2), int32(a.s(9)), colTextMute, alignLeft, false)
 }
 
 func (a *app) drawActions(c *surface, x, y, w, h float32) {
@@ -1051,7 +1047,7 @@ func (a *app) drawAccounts(c *surface, x, y, w, h float32) {
 			}
 		} else if acc.Disabled {
 			pwdTxt = T("跳过", "skipped")
-		} else if acc.Locked {
+		} else if acc.PwdCode == pwdLocked {
 			pwdTxt, pwdCol = T("已锁定", "locked out"), colWarn
 			pwdW = a.s(66)
 		}
@@ -1835,8 +1831,7 @@ func (a *app) onClick(id int) {
 						return err
 					}
 					notBlank := false
-					pwdProbeCache[strings.ToLower(name)] = pwdProbe{blank: &notBlank,
-						desc: T("已设置密码", "password set")}
+					pwdProbeCache[strings.ToLower(name)] = pwdProbeResult{blank: &notBlank, code: pwdSet}
 					a.lg.Say(T("[OK] 账户 %s 密码已更新(请在远程端用新密码登录)",
 						"[OK] password updated for %s"), name)
 					return nil

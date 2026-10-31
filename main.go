@@ -230,8 +230,8 @@ type acctInfo struct {
 	Disabled bool
 	BuiltIn  bool
 	Blank    *bool // nil = 无法判定
-	PwdDesc  string
-	Locked   bool
+	PwdCode  int
+	PwdErr   uint32
 	RemoteOK bool
 }
 
@@ -312,49 +312,96 @@ func groupMembers(group string) (map[string]bool, error) {
 	return out, nil
 }
 
-// testBlankPassword 用空密码尝试网络登录,按错误码区分"有无密码"。
-// 对有密码的账户会产生一次失败登录(坏密码计数 +1),所以结果要缓存。
-func testBlankPassword(user string) (blank *bool, desc string, locked bool) {
+// 密码状态码。文案在渲染时生成,便于运行时切换语言。
+const (
+	pwdUnknown = iota // 未探测
+	pwdBlank
+	pwdSet
+	pwdBlankPolicy
+	pwdExpired
+	pwdDisabled
+	pwdMustChange
+	pwdLocked
+	pwdBlankInteractive
+	pwdNoAccess
+	pwdError
+)
+
+func pwdText(code int, errno uint32) string {
+	switch code {
+	case pwdBlank:
+		return T("空密码", "blank password")
+	case pwdSet:
+		return T("已设置密码", "password set")
+	case pwdBlankPolicy:
+		return T("空密码(受空密码网络登录限制策略约束)", "blank password (blocked by policy)")
+	case pwdExpired:
+		return T("密码已过期,无法检测", "password expired, cannot probe")
+	case pwdDisabled:
+		return T("账户已禁用,无法检测", "account disabled, cannot probe")
+	case pwdMustChange:
+		return T("首次登录需改密,无法检测", "password must be changed, cannot probe")
+	case pwdLocked:
+		return T("账户已锁定,无法检测", "account locked out, cannot probe")
+	case pwdBlankInteractive:
+		return T("空密码(交互式空密码登录成功)", "blank password (interactive logon succeeded)")
+	case pwdNoAccess:
+		return T("无远程权限,未探测", "no RDP access, not probed")
+	case pwdError:
+		return fmt.Sprintf(T("无法检测(错误 %d)", "cannot probe (error %d)"), errno)
+	}
+	return T("未知", "unknown")
+}
+
+type pwdProbeResult struct {
+	blank *bool
+	code  int
+	errno uint32
+}
+
+// testBlankPassword 用空密码尝试网络登录,按错误码判断账户是否有密码。
+// 对有密码的账户会产生一次失败登录(坏密码计数 +1),所以结果必须缓存。
+func testBlankPassword(user string) pwdProbeResult {
 	var tok syscall.Handle
 	r, _, callErr := procLogonUserW.Call(utf16p(user), utf16p("."), utf16p(""), 3 /*NETWORK*/, 0, uintptr(unsafe.Pointer(&tok)))
 	if r != 0 {
 		syscall.CloseHandle(tok)
 		t := true
-		return &t, T("空密码(空密码登录成功)", "blank password (blank logon succeeded)"), false
+		return pwdProbeResult{blank: &t, code: pwdBlank}
 	}
 	switch errnoOf(callErr) {
 	case 1326: // ERROR_LOGON_FAILURE
 		f := false
-		return &f, T("已设置密码", "password set"), false
+		return pwdProbeResult{blank: &f, code: pwdSet}
 	case 1327: // ERROR_ACCOUNT_RESTRICTION
 		t := true
-		return &t, T("空密码(受空密码网络登录限制策略约束)", "blank password (blocked by policy)"), false
+		return pwdProbeResult{blank: &t, code: pwdBlankPolicy}
 	case 1330:
-		return nil, T("密码已过期,无法检测", "password expired, cannot probe"), false
+		return pwdProbeResult{code: pwdExpired}
 	case 1331:
-		return nil, T("账户已禁用,无法检测", "account disabled, cannot probe"), false
+		return pwdProbeResult{code: pwdDisabled}
 	case 1907: // ERROR_PASSWORD_MUST_CHANGE
-		return nil, T("首次登录需改密,无法检测", "password must be changed, cannot probe"), false
+		return pwdProbeResult{code: pwdMustChange}
 	case 1909: // ERROR_ACCOUNT_LOCKED_OUT
-		return nil, T("账户已锁定,无法检测", "account locked out, cannot probe"), true
+		return pwdProbeResult{code: pwdLocked}
 	case 1385: // 没有网络登录权限 → 改用交互式登录再试
 		r2, _, e2 := procLogonUserW.Call(utf16p(user), utf16p("."), utf16p(""), 2 /*INTERACTIVE*/, 0, uintptr(unsafe.Pointer(&tok)))
 		if r2 != 0 {
 			syscall.CloseHandle(tok)
 			t := true
-			return &t, T("空密码(交互式空密码登录成功)", "blank password (interactive logon succeeded)"), false
+			return pwdProbeResult{blank: &t, code: pwdBlankInteractive}
 		}
 		switch errnoOf(e2) {
 		case 1326:
 			f := false
-			return &f, T("已设置密码", "password set"), false
+			return pwdProbeResult{blank: &f, code: pwdSet}
 		case 1327:
 			t := true
-			return &t, T("空密码", "blank password"), false
+			return pwdProbeResult{blank: &t, code: pwdBlank}
 		}
-		return nil, fmt.Sprintf(T("无法检测(错误 %d)", "cannot probe (error %d)"), errnoOf(e2)), false
+		return pwdProbeResult{code: pwdError, errno: errnoOf(e2)}
 	default:
-		return nil, fmt.Sprintf(T("无法检测(错误 %d)", "cannot probe (error %d)"), errnoOf(callErr)), false
+		return pwdProbeResult{code: pwdError, errno: errnoOf(callErr)}
 	}
 }
 
@@ -362,26 +409,20 @@ var builtinNames = map[string]bool{
 	"administrator": true, "guest": true, "defaultaccount": true, "wdagutilityaccount": true,
 }
 
-// 密码探测缓存:探测等于一次失败登录,默认策略 10 次即锁定。
-// 因此只探测有远程权限的账户,进程内复用结果,已锁定的账户不再重复探测。
-type pwdProbe struct {
-	blank  *bool
-	desc   string
-	locked bool
-}
+// 探测等于一次失败登录,默认策略 10 次即锁定;因此只探测有远程权限的账户,
+// 进程内复用结果,已锁定的账户不再重复探测。
+var pwdProbeCache = map[string]pwdProbeResult{}
 
-var pwdProbeCache = map[string]pwdProbe{}
-
-func probePassword(user string, force bool) (*bool, string, bool) {
+func probePassword(user string, force bool) pwdProbeResult {
 	key := strings.ToLower(user)
 	if c, ok := pwdProbeCache[key]; ok {
-		if !force || c.locked {
-			return c.blank, c.desc, c.locked
+		if !force || c.code == pwdLocked {
+			return c
 		}
 	}
-	b, d, lk := testBlankPassword(user)
-	pwdProbeCache[key] = pwdProbe{blank: b, desc: d, locked: lk}
-	return b, d, lk
+	r := testBlankPassword(user)
+	pwdProbeCache[key] = r
+	return r
 }
 
 func analyzeAccounts(forceProbe bool) ([]acctInfo, error) {
@@ -406,11 +447,12 @@ func analyzeAccounts(forceProbe bool) ([]acctInfo, error) {
 		}
 		switch {
 		case a.Disabled:
-			a.PwdDesc = T("已禁用,跳过检测", "disabled, skipped")
+			a.PwdCode = pwdDisabled
 		case !a.RemoteOK:
-			a.PwdDesc = T("无远程权限,未探测", "no RDP access, not probed")
+			a.PwdCode = pwdNoAccess
 		default:
-			a.Blank, a.PwdDesc, a.Locked = probePassword(name, forceProbe)
+			r := probePassword(name, forceProbe)
+			a.Blank, a.PwdCode, a.PwdErr = r.blank, r.code, r.errno
 		}
 		res = append(res, a)
 	}
@@ -419,9 +461,9 @@ func analyzeAccounts(forceProbe bool) ([]acctInfo, error) {
 
 func printAccounts(accts []acctInfo, say logger) {
 	say("")
-	say("  %-18s %-8s %-12s %-30s %s",
+	say("  %-24s %-10s %-12s %-32s %s",
 		T("账户", "ACCOUNT"), T("状态", "STATE"), T("密码", "PASSWORD"), T("说明", "DETAIL"), T("RDP权限", "RDP"))
-	say("  " + strings.Repeat("-", 88))
+	say("  " + strings.Repeat("-", 94))
 	for _, a := range accts {
 		st := T("启用", "enabled")
 		if a.Disabled {
@@ -443,7 +485,7 @@ func printAccounts(accts []acctInfo, say logger) {
 		if a.BuiltIn {
 			bi = T("(内置)", " (built-in)")
 		}
-		say("  %-18s %-8s %-12s %-30s %s", a.Name+bi, st, pwd, a.PwdDesc, perm)
+		say("  %-24s %-10s %-12s %-32s %s", a.Name+bi, st, pwd, pwdText(a.PwdCode, a.PwdErr), perm)
 	}
 }
 
@@ -608,7 +650,7 @@ func runCheck(say logger) error {
 	if sr.AlreadyPatched == len(patchDefs) {
 		say(T("    [OK] 三处补丁点均已是\"已解锁\"状态", "    [OK] all three patch sites are already patched"))
 	} else if len(sr.Sites) == len(patchDefs) {
-		say(T("    [OK] 三处补丁点全部唯一命中(%s定位),支持自动补丁:", "    [OK] all three patch sites matched uniquely (%s); auto-patch supported:"), sr.Method)
+		say(T("    [OK] 三处补丁点全部唯一命中(%s定位),支持自动补丁:", "    [OK] all three patch sites matched uniquely (%s); auto-patch supported:"), methodLabel(sr.Method))
 		for _, s := range sr.Sites {
 			say("        %-24s @ %s:  %s -> %s   (%s)", s.Name, hexOff(s.Offset), s.OrigHex, s.NewHex, s.Desc)
 		}
@@ -684,7 +726,7 @@ func runUnlock(o unlockOpts, say logger) error {
 						why = append(why, T("空密码,无法 RDP 登录(图形界面点[设置密码]可修复)", "blank password, cannot log on over RDP (use Set password in the GUI)"))
 					}
 					if a.Blank == nil {
-						why = append(why, a.PwdDesc)
+						why = append(why, pwdText(a.PwdCode, a.PwdErr))
 					}
 					if len(why) == 0 {
 						why = append(why, T("状态待定", "state undetermined"))
@@ -1062,6 +1104,7 @@ Logs: %ProgramData%\rdpmulti\logs\rdpmulti-<time>.log (20 most recent kept)
 }
 
 func main() {
+	initLang()
 	if len(os.Args) >= 2 {
 		lg := NewLogger(true, true)
 		defer lg.Close()

@@ -18,36 +18,62 @@ import (
 	"fmt"
 )
 
+// 定位方式
+const (
+	methodNone = iota
+	methodExact
+	methodStructural
+)
+
+func methodLabel(m int) string {
+	switch m {
+	case methodExact:
+		return T("精确", "exact")
+	case methodStructural:
+		return T("结构", "structural")
+	}
+	return T("无", "none")
+}
+
 type patchDef struct {
 	Name     string
-	Desc     string
+	DescZh   string
+	DescEn   string
 	Match    []byte // 特征码(含跳转操作码,需在文件中唯一)
 	PatchOff int    // Match 内被替换字节的起始下标
 	New      []byte // 替换后的固定字节
 	KeepDisp bool   // true: 替换第二字节保留原跳转位移(短跳转条件→无条件)
 }
 
+func (d patchDef) desc() string {
+	if curLang == langEN {
+		return d.DescEn
+	}
+	return d.DescZh
+}
+
 var patchDefs = []patchDef{
 	{
 		Name:     "CDefPolicy::Query",
-		Desc:     "InUse==MaxAllowed 时返回\"许可耗尽\" → 改为无条件放行",
+		DescZh:   "InUse==MaxAllowed 时返回\"许可耗尽\" → 改为无条件放行",
+		DescEn:   "returns \"licence exhausted\" when InUse==MaxAllowed -> always allow",
 		Match:    []byte{0x44, 0x8B, 0x87, 0x3C, 0x06, 0x00, 0x00, 0x44, 0x8B, 0x8F, 0x38, 0x06, 0x00, 0x00, 0x45, 0x3B, 0xC1, 0x75},
 		PatchOff: 17,
 		New:      []byte{0xEB},
 		KeepDisp: true,
 	},
 	{
-		Name: "CDefPolicy::Logon",
-		Desc: T("新登录 InUse+1>MaxAllowed 时拒绝 → 改为永不拒绝",
-			"rejects a new logon when InUse+1>MaxAllowed -> never reject"),
+		Name:     "CDefPolicy::Logon",
+		DescZh:   "新登录 InUse+1>MaxAllowed 时拒绝 → 改为永不拒绝",
+		DescEn:   "rejects a new logon when InUse+1>MaxAllowed -> never reject",
 		Match:    []byte{0x3B, 0x9F, 0x38, 0x06, 0x00, 0x00, 0x7F},
 		PatchOff: 6,
 		New:      []byte{0x90, 0x90},
 	},
 	{
-		Name: "CDefPolicy::Reconnect",
-		Desc: T("重连 InUse+1>MaxAllowed 时拒绝 → 改为永不拒绝",
-			"rejects a reconnect when InUse+1>MaxAllowed -> never reject"),
+		Name:     "CDefPolicy::Reconnect",
+		DescZh:   "重连 InUse+1>MaxAllowed 时拒绝 → 改为永不拒绝",
+		DescEn:   "rejects a reconnect when InUse+1>MaxAllowed -> never reject",
 		Match:    []byte{0x3B, 0x87, 0x38, 0x06, 0x00, 0x00, 0x7F},
 		PatchOff: 6,
 		New:      []byte{0x90, 0x90},
@@ -67,7 +93,7 @@ type scanResult struct {
 	Sites          []patchSite
 	AlreadyPatched int
 	Missing        int
-	Method         string // "精确" / "结构"
+	Method         int // methodExact / methodStructural
 }
 
 func (r scanResult) Complete() bool {
@@ -86,9 +112,6 @@ func scanPatches(data []byte) scanResult {
 	}
 	// 都失败时返回精确扫描的结果(用于报告"命中几处")
 	r, _ := scanExact(data)
-	if r.Method == "" {
-		r.Method = T("无", "none")
-	}
 	return r
 }
 
@@ -96,7 +119,7 @@ func scanPatches(data []byte) scanResult {
 
 func scanExact(data []byte) (scanResult, bool) {
 	var res scanResult
-	res.Method = T("精确", "exact")
+	res.Method = methodExact
 	for _, d := range patchDefs {
 		fixed := d.Match[:d.PatchOff] // 跳转码之前的固定字节
 		var hits, patched []int
@@ -129,7 +152,7 @@ func scanExact(data []byte) (scanResult, bool) {
 			res.Sites = append(res.Sites, patchSite{
 				Name: d.Name, Offset: off + d.PatchOff,
 				OrigHex: hex.EncodeToString(orig), NewHex: hex.EncodeToString(nb),
-				Desc: d.Desc, Method: T("精确", "exact"),
+				Desc: d.desc(), Method: "exact",
 			})
 		case len(hits) > 1:
 			res.Missing++ // 多处命中视为不安全,按缺失处理
@@ -148,7 +171,7 @@ func le32(b []byte) uint32 { return binary.LittleEndian.Uint32(b) }
 
 func scanStructural(data []byte) (scanResult, bool) {
 	var res scanResult
-	res.Method = T("结构", "structural")
+	res.Method = methodStructural
 
 	// ---- 1) Query: mov r8d,[rdi+A] / mov r9d,[rdi+B] / cmp r8d,r9d / jne,且 B = A-4
 	type qHit struct {
@@ -191,7 +214,7 @@ func scanStructural(data []byte) (scanResult, bool) {
 			Name: patchDefs[0].Name, Offset: q.off + 17,
 			OrigHex: hex.EncodeToString(data[q.off+17 : q.off+19]),
 			NewHex:  hex.EncodeToString([]byte{0xEB, data[q.off+18]}),
-			Desc:    patchDefs[0].Desc, Method: T("结构", "structural"),
+			Desc:    patchDefs[0].desc(), Method: "structural",
 		})
 	}
 
@@ -246,7 +269,7 @@ func scanStructural(data []byte) (scanResult, bool) {
 				Name: sl.def.Name, Offset: u + 6,
 				OrigHex: hex.EncodeToString(data[u+6 : u+8]),
 				NewHex:  "9090",
-				Desc:    sl.def.Desc, Method: T("结构", "structural"),
+				Desc:    sl.def.desc(), Method: "structural",
 			})
 		case p >= 0:
 			res.AlreadyPatched++

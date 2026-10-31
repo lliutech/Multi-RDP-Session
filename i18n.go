@@ -111,6 +111,18 @@ func loadLangPref() {
 	setLang(systemLang())
 }
 
+// initLang 读取保存的语言,并允许 RDPMULTI_LANG 临时覆盖(GUI 与 CLI 都要调用,
+// 否则命令行会一直停在默认语言)。
+func initLang() {
+	loadLangPref()
+	switch os.Getenv("RDPMULTI_LANG") {
+	case "en":
+		setLangTransient(langEN)
+	case "zh":
+		setLangTransient(langZH)
+	}
+}
+
 func saveLangPref() {
 	if err := os.MkdirAll(stateDir(), 0755); err != nil {
 		return

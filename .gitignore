@@ -15,3 +15,6 @@ Thumbs.db
 # go
 *.test
 *.out
+
+# temp files
+*~
