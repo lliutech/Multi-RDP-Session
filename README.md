@@ -129,8 +129,8 @@ Set `RDPMULTI_LANG=en` or `zh` to force a language for one run.
 ## Build
 
 ```bash
-git clone https://github.com/<you>/rdp-multi
-cd rdp-multi
+git clone https://github.com/lliutech/Multi-RDP-Session
+cd Multi-RDP-Session
 go build -ldflags="-s -w" -o rdpmulti.exe .
 ```
 

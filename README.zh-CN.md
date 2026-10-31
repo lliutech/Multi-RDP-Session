@@ -115,8 +115,8 @@ Windows 10 1809–22H2 的 `CDefPolicy` 形状不同，**未经验证** —— �
 ## 构建
 
 ```bash
-git clone https://github.com/<you>/rdp-multi
-cd rdp-multi
+git clone https://github.com/lliutech/Multi-RDP-Session
+cd Multi-RDP-Session
 go build -ldflags="-s -w" -o rdpmulti.exe .
 ```
 
