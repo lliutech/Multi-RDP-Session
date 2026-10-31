@@ -22,7 +22,9 @@ jobs:
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
 
       - name: vet
-        run: go vet ./...
+        # unsafeptr is disabled on purpose: every Win32 call needs a uintptr
+        # conversion, which that check flags as a false positive.
+        run: go vet -unsafeptr=false ./...
 
       - name: test
         run: go test ./...
