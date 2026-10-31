@@ -1,0 +1,17 @@
+# build output
+/rdpmulti.exe
+/dist/
+
+# screenshots / captured UI (may contain local account names)
+preview*.png
+/screenshots/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# go
+*.test
+*.out
