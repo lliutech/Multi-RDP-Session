@@ -1,0 +1,14 @@
+# Normalize line endings so the source is identical on every platform.
+# Without this, a Windows checkout converts LF to CRLF and `gofmt -l` reports
+# every file as unformatted (which is what broke CI).
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.mod   text eol=lf
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.exe   binary
+*.png   binary
